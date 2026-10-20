@@ -26,6 +26,24 @@ DATABASE_FILE = "attendance.db"
 CHECK_INTERVAL_SECONDS = 10
 HEARTBEAT_SECONDS = 30
 
+try:
+    RECORDING_DELAY_MINUTES = int(
+        os.getenv("RECORDING_DELAY_MINUTES", "10")
+    )
+except ValueError as error:
+    raise ValueError(
+        "RECORDING_DELAY_MINUTES must be a whole number."
+    ) from error
+
+if RECORDING_DELAY_MINUTES < 1:
+    raise ValueError("RECORDING_DELAY_MINUTES must be at least 1.")
+
+RECORDING_DELAY_SECONDS = RECORDING_DELAY_MINUTES * 60
+RECORDING_TITLE_PREFIX = (
+    os.getenv("RECORDING_TITLE_PREFIX", "Attendance Recording").strip()
+    or "Attendance Recording"
+)
+
 if not api_id or not api_hash or not tracked_chat_id:
     raise ValueError(
         "Your .env file must contain WATCHER_API_ID, WATCHER_API_HASH, and TRACKED_CHAT_ID."
@@ -112,6 +130,7 @@ async def main():
     watcher_user_id = None
     open_sessions = {}
     name_cache = {}
+    recording_task = None
 
     async def get_display_name(user_id):
         if user_id in name_cache:
@@ -138,10 +157,10 @@ async def main():
         name_cache[user_id] = display_name
         return display_name
 
-    async def has_live_voice_chat():
+    async def get_live_voice_chat():
         """
-        Checks Telegram directly. Returns True only when this group already
-        has a real live voice chat running.
+        Returns the active Telegram group call only when this group already
+        has a real, unscheduled live voice chat running.
         """
         try:
             input_peer = await watcher.get_input_entity(TRACKED_CHAT_ID)
@@ -164,24 +183,93 @@ async def main():
                 )
 
             else:
-                return False
+                return None
 
             input_call = full_chat_result.full_chat.call
 
             if not isinstance(input_call, types.InputGroupCall):
-                return False
+                return None
 
-            group_call = await watcher(
+            group_call_result = await watcher(
                 functions.phone.GetGroupCallRequest(
                     call=input_call,
                     limit=1,
                 )
             )
 
-            return group_call.call.schedule_date is None
+            group_call = group_call_result.call
+
+            if not isinstance(group_call, types.GroupCall):
+                return None
+
+            if group_call.schedule_date is not None:
+                return None
+
+            return input_call, group_call
 
         except Exception:
-            return False
+            return None
+
+    async def has_live_voice_chat():
+        return await get_live_voice_chat() is not None
+
+    def make_recording_title():
+        timestamp = now_utc().strftime("%Y-%m-%d %H-%M UTC")
+        title = f"{RECORDING_TITLE_PREFIX} - {timestamp}"
+        return title[:64]
+
+    async def start_recording_after_delay(call_id_to_record):
+        """
+        Waits until the call has run for the configured period, then starts an
+        audio recording only when Telegram shows that no recording is active.
+        """
+        try:
+            await asyncio.sleep(RECORDING_DELAY_SECONDS)
+
+            if active_call_id != call_id_to_record:
+                return
+
+            live_voice_chat = await get_live_voice_chat()
+
+            if live_voice_chat is None:
+                print(
+                    "RECORDING SKIPPED: The voice chat ended before the "
+                    "recording check."
+                )
+                return
+
+            input_call, group_call = live_voice_chat
+
+            if group_call.record_start_date is not None:
+                print(
+                    "RECORDING ALREADY ACTIVE: Leaving the existing "
+                    "Telegram recording unchanged."
+                )
+                return
+
+            title = make_recording_title()
+
+            await watcher(
+                functions.phone.ToggleGroupCallRecordRequest(
+                    call=input_call,
+                    start=True,
+                    title=title,
+                    video=False,
+                )
+            )
+
+            print(f"RECORDING STARTED: {title}")
+
+        except asyncio.CancelledError:
+            print("RECORDING TIMER CANCELLED: The voice chat ended.")
+            raise
+
+        except Exception as error:
+            print(
+                "Could not start the recording after "
+                f"{RECORDING_DELAY_MINUTES} minutes: "
+                f"{type(error).__name__}: {error}"
+            )
 
     async def mark_joined(user_id):
         if active_call_id is None or user_id == watcher_user_id:
@@ -274,10 +362,15 @@ async def main():
             database.commit()
 
     async def finish_active_call(reason):
-        nonlocal active_call_id
+        nonlocal active_call_id, recording_task
 
         if active_call_id is None:
             return
+
+        if recording_task is not None and not recording_task.done():
+            recording_task.cancel()
+
+        recording_task = None
 
         ended_at = now_utc().isoformat()
         call_id_to_close = active_call_id
@@ -323,7 +416,7 @@ async def main():
         call_finished.set()
 
     async def start_active_call():
-        nonlocal active_call_id
+        nonlocal active_call_id, recording_task
 
         active_call_id = uuid4().hex
         started_at = now_utc().isoformat()
@@ -342,6 +435,14 @@ async def main():
             database.commit()
 
         print("\nCALL DETECTED. Attendance tracking has started.")
+
+        recording_task = asyncio.create_task(
+            start_recording_after_delay(active_call_id)
+        )
+        print(
+            "A recording check is scheduled for "
+            f"{RECORDING_DELAY_MINUTES} minutes from now."
+        )
 
         current_participants = await calls.get_participants(TRACKED_CHAT_ID)
 
@@ -381,6 +482,10 @@ async def main():
 
         print("Tracker is running.")
         print("It will check for a voice chat every 10 seconds.")
+        print(
+            "It will check whether recording is active "
+            f"{RECORDING_DELAY_MINUTES} minutes into each detected call."
+        )
         print("Keep this PowerShell window open during meetings.\n")
 
         waiting_message_shown = False

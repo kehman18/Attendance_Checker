@@ -1,9 +1,30 @@
 @echo off
+setlocal
 
-set "PROJECT_DIR=C:\Users\hp\Desktop\CallAttendanceTracker"
+set "PROJECT_DIR=%~dp0"
+set "PYTHON_EXE=%PROJECT_DIR%.venv\Scripts\python.exe"
 
-start "Attendance Tracker" /D "%PROJECT_DIR%" cmd /k %PROJECT_DIR%\.venv\Scripts\python.exe attendance_tracker.py
+cd /d "%PROJECT_DIR%"
 
-timeout /t 3 /nobreak > nul
+if not exist "%PYTHON_EXE%" (
+    echo ERROR: Virtual environment not found.
+    echo Expected: %PYTHON_EXE%
+    pause
+    exit /b 1
+)
 
-start "Attendance Report Bot" /D "%PROJECT_DIR%" cmd /k %PROJECT_DIR%\.venv\Scripts\python.exe report_bot.py
+if not exist "%PROJECT_DIR%attendance_tracker.py" (
+    echo ERROR: attendance_tracker.py was not found.
+    pause
+    exit /b 1
+)
+
+if not exist "%PROJECT_DIR%report_bot.py" (
+    echo ERROR: report_bot.py was not found.
+    pause
+    exit /b 1
+)
+
+start "Telegram Attendance Tracker" cmd /k ""%PYTHON_EXE%" "%PROJECT_DIR%attendance_tracker.py""
+timeout /t 3 /nobreak >nul
+start "Telegram Report Bot" cmd /k ""%PYTHON_EXE%" "%PROJECT_DIR%report_bot.py""
