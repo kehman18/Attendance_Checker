@@ -200,9 +200,28 @@ def parse_bible_reference(message_text):
 
 
 def clean_passage_text(content):
-    content = re.sub(r"<sup[^>]*>.*?</sup>", "", content, flags=re.IGNORECASE | re.DOTALL)
+    """Turn API.Bible HTML into one clear, numbered verse per line."""
+    def preserve_verse_number(match):
+        attributes = match.group("attributes")
+        number = match.group("number")
+
+        # API.Bible identifies a verse number with class="v" and/or data-number.
+        if re.search(r"(?:class=\"[^\"]*\bv\b[^\"]*\"|data-number=)", attributes):
+            return f"\n{number}. "
+        return number
+
+    content = re.sub(
+        r"<(?:span|sup)(?P<attributes>[^>]*)>\s*(?P<number>\d{1,3})\s*</(?:span|sup)>",
+        preserve_verse_number,
+        content,
+        flags=re.IGNORECASE,
+    )
+    content = re.sub(r"</?(?:p|div|br)[^>]*>", "\n", content, flags=re.IGNORECASE)
     content = re.sub(r"<[^>]+>", "", content)
-    return re.sub(r"\s+", " ", html.unescape(content)).strip()
+    content = html.unescape(content)
+    content = re.sub(r"[ \t]+", " ", content)
+    content = re.sub(r"\n\s*\n+", "\n", content)
+    return content.strip()
 
 
 def get_nkjv_passage(passage_id):
@@ -210,7 +229,7 @@ def get_nkjv_passage(passage_id):
     url = (
         f"{BIBLE_API_BASE_URL}/bibles/{NKJV_BIBLE_ID}/passages/{passage_id}"
         "?content-type=html&include-notes=false&include-titles=false&include-chapter-numbers=false"
-        "&include-verse-numbers=false"
+        "&include-verse-numbers=true"
     )
     request = Request(url, headers={"api-key": BIBLE_API_KEY, "accept": "application/json"})
 
